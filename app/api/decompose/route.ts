@@ -81,7 +81,7 @@ export async function POST(req: NextRequest) {
           { role: "user", content: userMessage },
         ],
         temperature: 0.2,
-        max_tokens: 4096,
+        max_tokens: 8192,
         stream: false,
       }),
     });
@@ -100,38 +100,76 @@ export async function POST(req: NextRequest) {
 
     const data = await upstream.json();
     const choice = data?.choices?.[0]?.message;
-    const raw =
-      (typeof choice?.content === "string" && choice.content.trim()) ||
-      (typeof choice?.reasoning_content === "string" &&
-        choice.reasoning_content.trim()) ||
-      "";
+    const content =
+      typeof choice?.content === "string" ? choice.content : "";
+    const reasoning =
+      typeof choice?.reasoning_content === "string"
+        ? choice.reasoning_content
+        : "";
+    // Combine — JSON may be in either field. Search both.
+    const haystack = (content + "\n" + reasoning).trim();
 
-    if (!raw) {
+    if (!haystack) {
       return new Response(
         JSON.stringify({ error: "Empty model response" }),
         { status: 502, headers: { "content-type": "application/json" } }
       );
     }
 
-    // Strip optional code fences and extract first JSON object
-    const cleaned = raw
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```\s*$/i, "")
-      .trim();
+    // Strip optional code fences
+    const stripped = haystack.replace(/```(?:json)?/gi, "").trim();
 
-    const firstBrace = cleaned.indexOf("{");
-    const lastBrace = cleaned.lastIndexOf("}");
-    if (firstBrace === -1 || lastBrace === -1) {
+    // Find the LAST balanced JSON object that contains a "root" key.
+    // We scan for "{" then walk forward tracking brace depth, also handling
+    // strings (so braces inside strings don't throw the count off).
+    function findLastRootObject(s: string): string | null {
+      const candidates: string[] = [];
+      for (let start = 0; start < s.length; start++) {
+        if (s[start] !== "{") continue;
+        let depth = 0;
+        let inStr = false;
+        let esc = false;
+        for (let i = start; i < s.length; i++) {
+          const c = s[i];
+          if (inStr) {
+            if (esc) {
+              esc = false;
+            } else if (c === "\\") {
+              esc = true;
+            } else if (c === '"') {
+              inStr = false;
+            }
+            continue;
+          }
+          if (c === '"') {
+            inStr = true;
+            continue;
+          }
+          if (c === "{") depth++;
+          else if (c === "}") {
+            depth--;
+            if (depth === 0) {
+              const block = s.slice(start, i + 1);
+              if (block.includes('"root"')) candidates.push(block);
+              break;
+            }
+          }
+        }
+      }
+      return candidates.length ? candidates[candidates.length - 1] : null;
+    }
+
+    const jsonText = findLastRootObject(stripped);
+    if (!jsonText) {
       return new Response(
         JSON.stringify({
           error: "Model did not return JSON",
-          sample: cleaned.slice(0, 300),
+          sample: stripped.slice(-400),
         }),
         { status: 502, headers: { "content-type": "application/json" } }
       );
     }
 
-    const jsonText = cleaned.slice(firstBrace, lastBrace + 1);
     let parsed: unknown;
     try {
       parsed = JSON.parse(jsonText);
